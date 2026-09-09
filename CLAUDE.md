@@ -254,6 +254,16 @@ message *or* in the timing. See `docs/ACCOUNTS.md`.
 
 Each of these cost real debugging time. Don't rediscover them.
 
+- **Pick the tool that ANSWERS, not the one that is installed.** A port
+  check chose `lsof` whenever `lsof` existed; in a container where lsof
+  cannot see network sockets it returns empty and exits 0, so the script
+  declared the port free and then died with EADDRINUSE. `fuser` had the pid
+  the whole time. Try each in turn and take the first non-empty result — and
+  decide "is the port busy" by opening a connection, not by whether a pid
+  lookup succeeded.
+- **Do not conflate "cannot connect" with "empty".** The same script reported
+  a stopped Postgres as an empty database and sent setup off to fail on a
+  connection error. Probe reachability separately from contents.
 - **`42P07` / `42710` on migrate means someone ran `drizzle-kit push`.** A
   table or type exists that no migration created, and there is no ledger.
   Never adopt that schema by skipping migrations: a pushed schema has no

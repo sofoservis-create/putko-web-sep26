@@ -45,13 +45,25 @@ if [ -z "${DATABASE_URL:-}" ]; then
   exit 1
 fi
 
-# Is it already set up? Cheap check: does the destinations table exist and
-# have rows. Re-running setup-db.sh is safe either way, but skipping it when
-# nothing is needed keeps this fast.
-count=$(psql "$DATABASE_URL" -tAc \
-  "SELECT count(*) FROM destinations" 2>/dev/null || echo "missing")
+# Can we even reach it? Checked separately from "is it set up", because
+# conflating the two makes an unreachable database report as an empty one —
+# which is what this script did on its first run against a stopped Postgres,
+# sending setup off to fail on a connection error while claiming the
+# database was empty.
+if ! conn_error=$(psql "$DATABASE_URL" -tAc "SELECT 1" 2>&1 >/dev/null); then
+  bad "cannot connect to the database."
+  echo
+  echo "$conn_error" | sed 's/^/     /'
+  echo
+  echo "     Check DATABASE_URL, and that the database is running."
+  exit 1
+fi
 
-if [ "$count" = "missing" ] || [ "$count" = "0" ]; then
+# Set up already? Re-running setup-db.sh is safe either way, but skipping it
+# when nothing is needed keeps this fast.
+count=$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM destinations" 2>/dev/null || echo "0")
+
+if [ "$count" = "0" ]; then
   echo "  database is empty — setting it up…"
   # No catch-all guess about the cause. setup-db.sh prints the real Postgres
   # error itself now; the previous version of this message blamed PostGIS for
@@ -67,7 +79,76 @@ else
   ok "$count destinations already seeded"
 fi
 
-say "4/4  Starting the app"
+say "4/4  Port 5000"
+
+# EADDRINUSE is the most likely thing to go wrong here, and the message
+# Next.js prints for it ("address already in use") does not say what has the
+# port or what to do. Worse, on Replit Ctrl+C often does not kill the old
+# server — the workflow keeps it alive — so the obvious remedy silently
+# fails and you get the same error again.
+# Try every tool and take the first that actually ANSWERS — not the first
+# that happens to be installed. The previous version picked lsof whenever
+# lsof existed, and in a container where lsof cannot see network sockets it
+# returns empty and exits 0, so the script concluded the port was free and
+# then failed with EADDRINUSE anyway. `fuser` found the pid immediately.
+port_holder_pids() {
+  local out
+  if command -v lsof >/dev/null 2>&1; then
+    out=$(lsof -t -i:5000 -sTCP:LISTEN 2>/dev/null)
+    [ -n "$out" ] && { printf '%s' "$out"; return; }
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    out=$(fuser 5000/tcp 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$')
+    [ -n "$out" ] && { printf '%s' "$out" | tr '\n' ' '; return; }
+  fi
+  # Last resort: whatever is running `next dev` for this workspace.
+  pgrep -f "next dev.*-p 5000" 2>/dev/null | tr '\n' ' '
+}
+
+# Whether the port is occupied is decided by trying to talk to it, not by
+# whether a pid lookup succeeded — the two can disagree, and the connection
+# is the thing that actually matters.
+port_busy() {
+  (exec 3<>/dev/tcp/127.0.0.1/5000) 2>/dev/null && exec 3>&- && return 0
+  return 1
+}
+
+pids=$(port_holder_pids)
+if port_busy; then
+  # If what is already there is this app, serving it, there is nothing to
+  # fix — say so and stop, rather than killing a working server and
+  # starting an identical one.
+  if curl -sf -o /dev/null --max-time 3 http://localhost:5000/ 2>/dev/null; then
+    ok "the app is ALREADY RUNNING on port 5000"
+    echo
+    echo "     Open the webview, or the *.replit.dev URL. Nothing to do."
+    echo "     To restart it anyway:  kill $pids  &&  bash scripts/replit-start.sh"
+    exit 0
+  fi
+
+  # Something holds the port but is not serving. Free it.
+  echo "  port 5000 is held${pids:+ by pid(s) $pids} but not serving — freeing it"
+  # shellcheck disable=SC2086
+  kill $pids 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    port_busy || break
+  done
+  if port_busy; then
+    # shellcheck disable=SC2086
+    kill -9 $(port_holder_pids) 2>/dev/null || true
+    sleep 2
+  fi
+  if port_busy; then
+    bad "could not free port 5000. Stop the Run workflow in Replit, then retry."
+    exit 1
+  fi
+  ok "freed"
+else
+  ok "free"
+fi
+
+say "Starting the app"
 echo "  Once it says Ready, open the webview — or the *.replit.dev URL."
 echo "  Demo login: demo-hostka@putko.example / demo-host@putko.example"
 echo "  Password:   putko-demo-2026"
